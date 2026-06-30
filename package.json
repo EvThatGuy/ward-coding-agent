@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Ward's dedicated coding agent — polls LaunchWise OS for code directives, clones the repo, runs Claude Code on a branch, and opens a PR.",
+  "description": "Ward's dedicated coding agent — polls LaunchWise OS for code directives, clones the repo, runs Claude Code or Cursor Composer on a branch, and opens a PR.",
   "engines": { "node": ">=20" },
   "scripts": { "start": "node index.js" }
 }
