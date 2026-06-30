@@ -10,8 +10,14 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends git ca-certificates bash python3 make g++ \
   && rm -rf /var/lib/apt/lists/*
 
-# Claude Code CLI — Ward's coding brain (authed by CLAUDE_CODE_OAUTH_TOKEN at runtime).
+# Claude Code CLI — default coding brain (authed by CLAUDE_CODE_OAUTH_TOKEN at runtime).
 RUN npm install -g @anthropic-ai/claude-code
+
+# Cursor Agent CLI (Composer) — optional engine (authed by CURSOR_API_KEY at runtime).
+# Installed into the node user's HOME so setuid child processes can find `agent`.
+RUN mkdir -p /home/node \
+  && HOME=/home/node bash -c 'curl https://cursor.com/install -fsS | bash' \
+  && chown -R node:node /home/node
 
 WORKDIR /app
 COPY package.json ./
@@ -22,6 +28,7 @@ COPY index.js ./
 # can setuid into node for child processes.
 RUN mkdir -p /home/node && chown -R node:node /home/node /app
 ENV HOME=/home/node
+ENV PATH="/home/node/.local/bin:${PATH}"
 ENV NODE_ENV=production
 
 CMD ["node", "index.js"]

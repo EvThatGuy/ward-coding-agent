@@ -3,7 +3,8 @@
 // Polls LaunchWise OS for directives Ward has dispatched to this agent and runs
 // them. Its job is engineering: for a `code` directive it clones the target repo,
 // runs Claude Code as a coding agent on a fresh branch, pushes, and opens a PR for
-// review (it NEVER merges to the default branch). The GET poll doubles as a
+// review (it NEVER merges to the default branch). Supports Claude Code or Cursor
+// Composer (via the `agent` CLI) as the coding engine. The GET poll doubles as a
 // heartbeat so the OS shows this agent Connected. Fully env-gated: with no
 // LWOS_BASE / WARD_AGENT_KEY it exits cleanly.
 //
@@ -19,8 +20,15 @@ const BASE = (process.env.LWOS_BASE || "").replace(/\/+$/, "");
 const KEY = process.env.WARD_AGENT_KEY || "";
 const AGENT_ID = process.env.WARD_AGENT_ID || "coding";
 const POLL_MS = parseInt(process.env.DIRECTIVE_POLL_MS || "20000", 10);
-const MODEL = process.env.AGENT_MODEL || "sonnet";
+const ENGINE = (process.env.AGENT_ENGINE || "claude").toLowerCase();
+if (ENGINE !== "claude" && ENGINE !== "composer") {
+  console.log(`[coding-agent] disabled — AGENT_ENGINE must be "claude" or "composer", got "${ENGINE}".`);
+  process.exit(1);
+}
+const DEFAULT_MODEL = ENGINE === "composer" ? "composer-2.5" : "sonnet";
+const MODEL = process.env.AGENT_MODEL || DEFAULT_MODEL;
 const GH_TOKEN = process.env.GH_TOKEN || process.env.GITHUB_TOKEN || "";
+const CURSOR_API_KEY = process.env.CURSOR_API_KEY || "";
 const RESULT_CAP = 1500;
 
 // Claude refuses bypassPermissions as root, so git + Claude run as the
@@ -35,6 +43,9 @@ if (!BASE || !KEY) {
   process.exit(0);
 }
 if (!GH_TOKEN) console.log("[coding-agent] WARNING: no GH_TOKEN set — code tasks will fail until it is.");
+if (ENGINE === "composer" && !CURSOR_API_KEY) {
+  console.log("[coding-agent] WARNING: AGENT_ENGINE=composer but no CURSOR_API_KEY — agent runs will fail until it is.");
+}
 
 const api = (path, opts = {}) =>
   fetch(`${BASE}${path}`, {
@@ -61,16 +72,11 @@ function sh(cmd, cwd) {
   });
 }
 
-function spawnClaude(prompt, cwd) {
+function spawnChild(cmd, args, cwd, timeoutMs) {
   return new Promise((resolve) => {
-    const child = spawn(
-      "claude",
-      ["-p", prompt, "--model", MODEL, "--allowedTools", "Read,Write,Edit,Bash,Glob,Grep",
-       "--permission-mode", "bypassPermissions", "--output-format", "text"],
-      { cwd, uid: NODE_UID, gid: NODE_GID, env: CHILD_ENV, stdio: ["ignore", "pipe", "pipe"] },
-    );
+    const child = spawn(cmd, args, { cwd, uid: NODE_UID, gid: NODE_GID, env: CHILD_ENV, stdio: ["ignore", "pipe", "pipe"] });
     let out = "";
-    const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, parseInt(process.env.CODE_RUN_TIMEOUT_MS || "600000", 10));
+    const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, timeoutMs);
     child.stdout.on("data", (d) => (out += d));
     child.stderr.on("data", (d) => (out += d));
     child.on("error", () => { clearTimeout(timer); resolve({ code: -1, out }); });
@@ -78,7 +84,28 @@ function spawnClaude(prompt, cwd) {
   });
 }
 
-// ── code directive: clone → Claude on a branch → push → open a PR ──────────────
+function spawnClaude(prompt, cwd, { readOnly = false, timeoutMs } = {}) {
+  const args = [
+    "-p", prompt, "--model", MODEL, "--permission-mode", "bypassPermissions", "--output-format", "text",
+    "--allowedTools", readOnly ? "" : "Read,Write,Edit,Bash,Glob,Grep",
+  ];
+  const timeout = timeoutMs ?? parseInt(process.env.CODE_RUN_TIMEOUT_MS || "600000", 10);
+  return spawnChild("claude", args, cwd, timeout);
+}
+
+function spawnComposer(prompt, cwd, { readOnly = false, timeoutMs } = {}) {
+  const args = ["-p", prompt, "--model", MODEL, "--output-format", "text", "--trust"];
+  if (readOnly) args.push("--mode", "ask");
+  else args.push("--force");
+  const timeout = timeoutMs ?? parseInt(process.env.CODE_RUN_TIMEOUT_MS || "600000", 10);
+  return spawnChild("agent", args, cwd, timeout);
+}
+
+function spawnAgent(prompt, cwd, opts = {}) {
+  return ENGINE === "composer" ? spawnComposer(prompt, cwd, opts) : spawnClaude(prompt, cwd, opts);
+}
+
+// ── code directive: clone → agent on a branch → push → open a PR ─────────────
 async function runCode(d) {
   const repo = (d.repo || "").trim();
   if (!repo.includes("/")) return { ok: false, result: "Code task had no valid owner/repo." };
@@ -98,10 +125,10 @@ async function runCode(d) {
     const prompt =
       `You are making a focused code change in the repository "${repo}" (working directory is the repo root). Task:\n\n${d.directive}\n\n` +
       `Edit the files directly. Keep the change correct, minimal, and consistent with the surrounding code. Do NOT run git, commit, or push — just make the edits. When done, briefly summarize what you changed.`;
-    const claude = await spawnClaude(prompt, repoDir);
+    const agent = await spawnAgent(prompt, repoDir);
 
     const status = (await sh(`git status --porcelain`, repoDir)).out.trim();
-    if (!status) return { ok: true, result: `No changes were needed. ${clip(oneLine(claude.out).slice(-400))}` };
+    if (!status) return { ok: true, result: `No changes were needed. ${clip(oneLine(agent.out).slice(-400))}` };
 
     await sh(`git add -A && git commit -m "Ward: ${oneLine(d.directive).slice(0, 70)}"`, repoDir);
     const push = await sh(`git push origin ${branch}`, repoDir);
@@ -114,7 +141,7 @@ async function runCode(d) {
         title: `Ward: ${oneLine(d.directive).slice(0, 80)}`,
         head: branch,
         base,
-        body: `Automated by Ward's coding agent from a dispatched directive.\n\n**Task:** ${d.directive}\n\n**Change notes:**\n${clip(oneLine(claude.out).slice(-800))}\n\nReview before merging — Ward never merges to ${base} unattended.`,
+        body: `Automated by Ward's coding agent from a dispatched directive.\n\n**Task:** ${d.directive}\n\n**Change notes:**\n${clip(oneLine(agent.out).slice(-800))}\n\nReview before merging — Ward never merges to ${base} unattended.`,
       }),
     });
     const pr = await prRes.json().catch(() => ({}));
@@ -127,21 +154,14 @@ async function runCode(d) {
   }
 }
 
-// ── ops directive: a generic Claude reasoning pass (no repo) ───────────────────
-function runGeneric(d) {
-  return new Promise((resolve) => {
-    const prompt =
-      `You are Ward's coding agent. Directive from the LaunchWise OS command center: ${d.directive}\n\n` +
-      `Reply with a concise, useful engineering answer (a few sentences). You have no repo checked out in this pass, so don't claim to have changed code; if it needs a real change, say which repo + change would do it. Reply with ONLY the answer text.`;
-    const child = spawn("claude", ["-p", prompt, "--model", MODEL, "--allowedTools", "", "--permission-mode", "bypassPermissions", "--output-format", "text"],
-      { uid: NODE_UID, gid: NODE_GID, env: CHILD_ENV, stdio: ["ignore", "pipe", "pipe"] });
-    let out = "";
-    const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, parseInt(process.env.OPS_RUN_TIMEOUT_MS || "90000", 10));
-    child.stdout.on("data", (x) => (out += x));
-    child.stderr.on("data", (x) => (out += x));
-    child.on("error", () => { clearTimeout(timer); resolve({ ok: false, result: "Generic run failed to start." }); });
-    child.on("close", (code) => { clearTimeout(timer); const t = clip(oneLine(out).slice(-RESULT_CAP * 2)); resolve({ ok: code === 0 && !!t, result: t || "Completed." }); });
-  });
+// ── ops directive: a generic agent reasoning pass (no repo) ───────────────────
+async function runGeneric(d) {
+  const prompt =
+    `You are Ward's coding agent. Directive from the LaunchWise OS command center: ${d.directive}\n\n` +
+    `Reply with a concise, useful engineering answer (a few sentences). You have no repo checked out in this pass, so don't claim to have changed code; if it needs a real change, say which repo + change would do it. Reply with ONLY the answer text.`;
+  const out = await spawnAgent(prompt, undefined, { readOnly: true, timeoutMs: parseInt(process.env.OPS_RUN_TIMEOUT_MS || "90000", 10) });
+  const t = clip(oneLine(out.out).slice(-RESULT_CAP * 2));
+  return { ok: out.code === 0 && !!t, result: t || "Completed." };
 }
 
 async function execute(d) {
@@ -174,6 +194,6 @@ async function tick() {
   }
 }
 
-console.log(`[coding-agent] online → ${BASE} as "${AGENT_ID}" every ${Math.round(POLL_MS / 1000)}s${GH_TOKEN ? " (PRs enabled)" : " (NO GH_TOKEN)"}`);
+console.log(`[coding-agent] online → ${BASE} as "${AGENT_ID}" every ${Math.round(POLL_MS / 1000)}s engine=${ENGINE} model=${MODEL}${GH_TOKEN ? " (PRs enabled)" : " (NO GH_TOKEN)"}`);
 setTimeout(tick, 3000);
 setInterval(tick, POLL_MS);
