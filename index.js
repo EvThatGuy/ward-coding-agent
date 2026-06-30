@@ -3,8 +3,9 @@
 // Polls LaunchWise OS for directives Ward has dispatched to this agent and runs
 // them. Its job is engineering: for a `code` directive it clones the target repo,
 // runs Claude Code as a coding agent on a fresh branch, pushes, and opens a PR for
-// review (it NEVER merges to the default branch). Supports Claude Code or Cursor
-// Composer (via the `agent` CLI) as the coding engine. The GET poll doubles as a
+// review (it NEVER merges to the default branch). Supports Claude Code and Cursor
+// Composer (via the `agent` CLI), including Composer-first with Claude fallback.
+// The GET poll doubles as a
 // heartbeat so the OS shows this agent Connected. Fully env-gated: with no
 // LWOS_BASE / WARD_AGENT_KEY it exits cleanly.
 //
@@ -21,15 +22,21 @@ const KEY = process.env.WARD_AGENT_KEY || "";
 const AGENT_ID = process.env.WARD_AGENT_ID || "coding";
 const POLL_MS = parseInt(process.env.DIRECTIVE_POLL_MS || "20000", 10);
 const ENGINE = (process.env.AGENT_ENGINE || "claude").toLowerCase();
-if (ENGINE !== "claude" && ENGINE !== "composer") {
-  console.log(`[coding-agent] disabled — AGENT_ENGINE must be "claude" or "composer", got "${ENGINE}".`);
+const VALID_ENGINES = new Set(["claude", "composer", "composer-fallback"]);
+if (!VALID_ENGINES.has(ENGINE)) {
+  console.log(`[coding-agent] disabled — AGENT_ENGINE must be "claude", "composer", or "composer-fallback", got "${ENGINE}".`);
   process.exit(1);
 }
-const DEFAULT_MODEL = ENGINE === "composer" ? "composer-2.5" : "sonnet";
-const MODEL = process.env.AGENT_MODEL || DEFAULT_MODEL;
+const COMPOSER_MODEL = process.env.COMPOSER_MODEL || process.env.AGENT_MODEL || "composer-2.5";
+const CLAUDE_MODEL = process.env.CLAUDE_MODEL || process.env.AGENT_MODEL || "sonnet";
 const GH_TOKEN = process.env.GH_TOKEN || process.env.GITHUB_TOKEN || "";
 const CURSOR_API_KEY = process.env.CURSOR_API_KEY || "";
 const RESULT_CAP = 1500;
+
+function engineChain() {
+  if (ENGINE === "composer-fallback") return ["composer", "claude"];
+  return [ENGINE];
+}
 
 // Claude refuses bypassPermissions as root, so git + Claude run as the
 // unprivileged `node` user (uid/gid 1000) with its own HOME. The container
@@ -43,8 +50,12 @@ if (!BASE || !KEY) {
   process.exit(0);
 }
 if (!GH_TOKEN) console.log("[coding-agent] WARNING: no GH_TOKEN set — code tasks will fail until it is.");
-if (ENGINE === "composer" && !CURSOR_API_KEY) {
-  console.log("[coding-agent] WARNING: AGENT_ENGINE=composer but no CURSOR_API_KEY — agent runs will fail until it is.");
+const chain = engineChain();
+if (chain.includes("composer") && !CURSOR_API_KEY) {
+  console.log("[coding-agent] WARNING: Composer in engine chain but no CURSOR_API_KEY — will skip/fail Composer runs.");
+}
+if (chain.includes("claude") && !process.env.CLAUDE_CODE_OAUTH_TOKEN) {
+  console.log("[coding-agent] WARNING: Claude in engine chain but no CLAUDE_CODE_OAUTH_TOKEN — Claude runs may fail.");
 }
 
 const api = (path, opts = {}) =>
@@ -84,25 +95,52 @@ function spawnChild(cmd, args, cwd, timeoutMs) {
   });
 }
 
-function spawnClaude(prompt, cwd, { readOnly = false, timeoutMs } = {}) {
+function spawnClaude(prompt, cwd, { readOnly = false, timeoutMs, model = CLAUDE_MODEL } = {}) {
   const args = [
-    "-p", prompt, "--model", MODEL, "--permission-mode", "bypassPermissions", "--output-format", "text",
+    "-p", prompt, "--model", model, "--permission-mode", "bypassPermissions", "--output-format", "text",
     "--allowedTools", readOnly ? "" : "Read,Write,Edit,Bash,Glob,Grep",
   ];
   const timeout = timeoutMs ?? parseInt(process.env.CODE_RUN_TIMEOUT_MS || "600000", 10);
   return spawnChild("claude", args, cwd, timeout);
 }
 
-function spawnComposer(prompt, cwd, { readOnly = false, timeoutMs } = {}) {
-  const args = ["-p", prompt, "--model", MODEL, "--output-format", "text", "--trust"];
+function spawnComposer(prompt, cwd, { readOnly = false, timeoutMs, model = COMPOSER_MODEL } = {}) {
+  const args = ["-p", prompt, "--model", model, "--output-format", "text", "--trust"];
   if (readOnly) args.push("--mode", "ask");
   else args.push("--force");
   const timeout = timeoutMs ?? parseInt(process.env.CODE_RUN_TIMEOUT_MS || "600000", 10);
   return spawnChild("agent", args, cwd, timeout);
 }
 
-function spawnAgent(prompt, cwd, opts = {}) {
-  return ENGINE === "composer" ? spawnComposer(prompt, cwd, opts) : spawnClaude(prompt, cwd, opts);
+function canRunEngine(engine) {
+  if (engine === "composer") return !!CURSOR_API_KEY;
+  if (engine === "claude") return !!process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  return false;
+}
+
+async function spawnAgent(prompt, cwd, opts = {}) {
+  const engines = engineChain();
+  let last = { code: -1, out: "", engine: engines.at(-1) };
+
+  for (let i = 0; i < engines.length; i++) {
+    const engine = engines[i];
+    const isLast = i === engines.length - 1;
+
+    if (!canRunEngine(engine)) {
+      console.log(`[coding-agent] skipping ${engine} — missing credentials`);
+      if (isLast) return { ...last, engine, skipped: true };
+      continue;
+    }
+
+    console.log(`[coding-agent] running with ${engine}`);
+    const result = await (engine === "composer" ? spawnComposer : spawnClaude)(prompt, cwd, opts);
+    last = { ...result, engine };
+
+    if (result.code === 0 || isLast) return last;
+    console.log(`[coding-agent] ${engine} failed (code ${result.code}), trying fallback...`);
+  }
+
+  return last;
 }
 
 // ── code directive: clone → agent on a branch → push → open a PR ─────────────
@@ -126,9 +164,10 @@ async function runCode(d) {
       `You are making a focused code change in the repository "${repo}" (working directory is the repo root). Task:\n\n${d.directive}\n\n` +
       `Edit the files directly. Keep the change correct, minimal, and consistent with the surrounding code. Do NOT run git, commit, or push — just make the edits. When done, briefly summarize what you changed.`;
     const agent = await spawnAgent(prompt, repoDir);
+    const engineLabel = agent.engine || ENGINE;
 
     const status = (await sh(`git status --porcelain`, repoDir)).out.trim();
-    if (!status) return { ok: true, result: `No changes were needed. ${clip(oneLine(agent.out).slice(-400))}` };
+    if (!status) return { ok: true, result: `No changes were needed (${engineLabel}). ${clip(oneLine(agent.out).slice(-400))}` };
 
     await sh(`git add -A && git commit -m "Ward: ${oneLine(d.directive).slice(0, 70)}"`, repoDir);
     const push = await sh(`git push origin ${branch}`, repoDir);
@@ -141,7 +180,7 @@ async function runCode(d) {
         title: `Ward: ${oneLine(d.directive).slice(0, 80)}`,
         head: branch,
         base,
-        body: `Automated by Ward's coding agent from a dispatched directive.\n\n**Task:** ${d.directive}\n\n**Change notes:**\n${clip(oneLine(agent.out).slice(-800))}\n\nReview before merging — Ward never merges to ${base} unattended.`,
+        body: `Automated by Ward's coding agent from a dispatched directive.\n\n**Task:** ${d.directive}\n\n**Engine:** ${engineLabel}\n\n**Change notes:**\n${clip(oneLine(agent.out).slice(-800))}\n\nReview before merging — Ward never merges to ${base} unattended.`,
       }),
     });
     const pr = await prRes.json().catch(() => ({}));
@@ -161,7 +200,8 @@ async function runGeneric(d) {
     `Reply with a concise, useful engineering answer (a few sentences). You have no repo checked out in this pass, so don't claim to have changed code; if it needs a real change, say which repo + change would do it. Reply with ONLY the answer text.`;
   const out = await spawnAgent(prompt, undefined, { readOnly: true, timeoutMs: parseInt(process.env.OPS_RUN_TIMEOUT_MS || "90000", 10) });
   const t = clip(oneLine(out.out).slice(-RESULT_CAP * 2));
-  return { ok: out.code === 0 && !!t, result: t || "Completed." };
+  const engineNote = out.engine ? ` (${out.engine})` : "";
+  return { ok: out.code === 0 && !!t, result: (t || "Completed.") + engineNote };
 }
 
 async function execute(d) {
@@ -194,6 +234,6 @@ async function tick() {
   }
 }
 
-console.log(`[coding-agent] online → ${BASE} as "${AGENT_ID}" every ${Math.round(POLL_MS / 1000)}s engine=${ENGINE} model=${MODEL}${GH_TOKEN ? " (PRs enabled)" : " (NO GH_TOKEN)"}`);
+console.log(`[coding-agent] online → ${BASE} as "${AGENT_ID}" every ${Math.round(POLL_MS / 1000)}s engine=${ENGINE} chain=${engineChain().join("→")}${GH_TOKEN ? " (PRs enabled)" : " (NO GH_TOKEN)"}`);
 setTimeout(tick, 3000);
 setInterval(tick, POLL_MS);
